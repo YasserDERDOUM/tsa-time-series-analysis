@@ -1,14 +1,19 @@
-import { useTheme } from "next-themes"
 import { Toaster as Sonner, toast } from "sonner"
 
-const Toaster = ({
-  ...props
-}) => {
-  const { theme = "system" } = useTheme()
+/**
+ * Version CRA / React (pas Next.js)
+ * - Pas de next-themes
+ * - Thème auto basé sur la préférence système (dark/light)
+ */
+const Toaster = ({ ...props }) => {
+  const isDark =
+    typeof window !== "undefined" &&
+    window.matchMedia &&
+    window.matchMedia("(prefers-color-scheme: dark)").matches
 
   return (
     <Sonner
-      theme={theme}
+      theme={isDark ? "dark" : "light"}
       className="toaster group"
       toastOptions={{
         classNames: {
@@ -21,8 +26,9 @@ const Toaster = ({
             "group-[.toast]:bg-muted group-[.toast]:text-muted-foreground",
         },
       }}
-      {...props} />
-  );
+      {...props}
+    />
+  )
 }
 
 export { Toaster, toast }
