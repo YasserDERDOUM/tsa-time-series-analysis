@@ -17,7 +17,7 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import warnings
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 warnings.filterwarnings('ignore')
 
 
@@ -234,14 +234,13 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
             "error": str(e)
         }
 
-
 async def generate_ai_report(analysis_data: Dict[str, Any], report_mode: str = "court", 
-                            model_type: str = "gpt-5-mini") -> str:
-    """Generate AI report using LLM"""
+                            model_type: str = "gpt-4o-mini") -> str:
+    """Generate AI report using OpenAI API"""
     try:
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        api_key = os.environ.get('OPENAI_API_KEY')
         if not api_key:
-            return "⚠️ Clé API manquante. Veuillez configurer EMERGENT_LLM_KEY dans le fichier .env"
+            return "⚠️ Clé API OpenAI manquante. Veuillez configurer OPENAI_API_KEY dans le fichier .env"
         
         if report_mode == "long":
             prompt = f"""Vous êtes un expert en analyse de séries temporelles. Analysez les données suivantes et fournissez un rapport détaillé et professionnel.
@@ -274,19 +273,22 @@ Rapport concis incluant:
 
 Soyez direct et actionnable."""
         
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=f"timeseries-{datetime.now().isoformat()}",
-            system_message="Vous êtes un expert en analyse de séries temporelles et en modélisation statistique."
+        client = AsyncOpenAI(api_key=api_key)
+        
+        response = await client.chat.completions.create(
+            model=model_type,
+            messages=[
+                {"role": "system", "content": "Vous êtes un expert en analyse de séries temporelles et en modélisation statistique."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
         )
-        chat.with_model("openai", model_type)
         
-        user_message = UserMessage(text=prompt)
-        response = await chat.send_message(user_message)
-        
-        return response
+        return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ Erreur lors de la génération du rapport IA: {str(e)}"
+
 
 # ============ API ROUTES ============
 
@@ -458,4 +460,5 @@ app.add_middleware(
 # Root endpoint
 @app.get("/")
 async def main_root():
+
     return {"message": "TSA API - Time Series Analysis", "docs": "/docs"}
