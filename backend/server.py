@@ -18,16 +18,76 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import warnings
 from openai import AsyncOpenAI
+from urllib.parse import urlsplit, urlunsplit, quote_plus  # ✅ added
+
 warnings.filterwarnings('ignore')
 
 
+# =====================================================
+# ENV / LOGS
+# =====================================================
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("tsa-api")
+
+def _get_env(name: str, required: bool = False, default: Optional[str] = None) -> str:
+    val = os.getenv(name, default)
+    if required and (val is None or str(val).strip() == ""):
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return val
+
+
+# =====================================================
+# MONGODB (SAFE URI) ✅ FIX
+# =====================================================
+def sanitize_mongo_uri(uri: str) -> str:
+    """
+    Ensure username/password in MongoDB URI are RFC3986-escaped.
+    Fixes passwords containing special chars like @ : / ? # %
+    Works for mongodb:// and mongodb+srv://
+    """
+    parts = urlsplit(uri)
+    netloc = parts.netloc  # can contain userinfo@host
+
+    if "@" not in netloc:
+        return uri  # no userinfo, nothing to escape
+
+    userinfo, hostpart = netloc.rsplit("@", 1)
+
+    # userinfo can be "user:pass" or just "user"
+    if ":" in userinfo:
+        user, pwd = userinfo.split(":", 1)
+        user_enc = quote_plus(user)
+        pwd_enc = quote_plus(pwd)
+        new_netloc = f"{user_enc}:{pwd_enc}@{hostpart}"
+    else:
+        user_enc = quote_plus(userinfo)
+        new_netloc = f"{user_enc}@{hostpart}"
+
+    return urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+
+
+# MongoDB connection ✅ FIX
+mongo_url_raw = _get_env("MONGO_URL", required=True)
+mongo_url = sanitize_mongo_uri(mongo_url_raw)
+
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=8000,
+    connectTimeoutMS=8000,
+    socketTimeoutMS=8000,
+)
+
+db_name = _get_env("DB_NAME", required=True)
+db = client[db_name]
+logger.info("Mongo configured (db=%s)", db_name)
+
+
+# =====================================================
+# FASTAPI
+# =====================================================
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -36,13 +96,16 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 
-# Define Models
+# =====================================================
+# MODELS
+# =====================================================
 class StatusCheck(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     client_name: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 class StatusCheckCreate(BaseModel):
     client_name: str
@@ -54,6 +117,7 @@ class ColumnSelectionRequest(BaseModel):
     date_column: str
     value_column: str
     duplicate_strategy: str = "mean"
+
 
 class ForecastRequest(BaseModel):
     file_id: str
@@ -70,6 +134,7 @@ class ForecastRequest(BaseModel):
     m: int = 12
     forecast_horizon: int = 12
 
+
 class AIReportRequest(BaseModel):
     file_id: str
     analysis_data: Dict[str, Any]
@@ -77,7 +142,9 @@ class AIReportRequest(BaseModel):
     report_mode: str = "court"
 
 
-# ============ TIME SERIES HELPER FUNCTIONS ============
+# =====================================================
+# TIME SERIES HELPERS
+# =====================================================
 def parse_dataframe(file_content: bytes, filename: str) -> pd.DataFrame:
     """Parse CSV or Excel file and return DataFrame"""
     try:
@@ -100,16 +167,17 @@ def prepare_timeseries(df: pd.DataFrame, date_col: str, value_col: str, duplicat
         df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
         df = df.dropna(subset=[value_col])
         df = df.sort_values(date_col)
-        
+
         if duplicate_strategy == "mean":
             df = df.groupby(date_col)[value_col].mean().reset_index()
         elif duplicate_strategy == "sum":
             df = df.groupby(date_col)[value_col].sum().reset_index()
-        
+
         df.set_index(date_col, inplace=True)
         return df[value_col]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erreur de préparation des données: {str(e)}")
+
 
 def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str, Any]:
     """Perform STL decomposition"""
@@ -123,17 +191,17 @@ def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str
                     period = 12
             else:
                 period = 12
-        
+
         if len(series) < 2 * period:
             return {
                 "success": False,
                 "error": f"Série trop courte pour décomposition STL (besoin d'au moins {2 * period} observations, seulement {len(series)} disponibles)",
                 "period": period
             }
-        
+
         stl = STL(series, seasonal=period)
         result = stl.fit()
-        
+
         return {
             "success": True,
             "trend": result.trend.tolist(),
@@ -155,14 +223,14 @@ def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
     try:
         result = adfuller(series.dropna())
         adf_stat, p_value, usedlag, nobs, critical_values, icbest = result
-        
+
         is_stationary = p_value < 0.05
         interpretation = (
             f"La série est {'stationnaire' if is_stationary else 'non-stationnaire'} "
             f"(p-value = {p_value:.4f}). "
             f"{'Pas besoin de différenciation.' if is_stationary else 'Différenciation recommandée.'}"
         )
-        
+
         return {
             "adf_statistic": float(adf_stat),
             "p_value": float(p_value),
@@ -179,7 +247,7 @@ def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
         }
 
 
-def train_forecast_model(series: pd.Series, p: int, d: int, q: int, 
+def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
                          P: int = 0, D: int = 0, Q: int = 0, m: int = 12,
                          forecast_horizon: int = 12) -> Dict[str, Any]:
     """Train ARIMA/SARIMA model and generate forecasts"""
@@ -190,20 +258,20 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
                 "success": False,
                 "error": f"Série trop courte pour entraîner le modèle (besoin d'au moins {min_obs} observations)"
             }
-        
+
         seasonal = P > 0 or D > 0 or Q > 0
         seasonal_order = (P, D, Q, m) if seasonal else (0, 0, 0, 0)
-        
+
         model = SARIMAX(series, order=(p, d, q), seasonal_order=seasonal_order)
         fitted_model = model.fit(disp=False)
-        
+
         forecast_result = fitted_model.get_forecast(steps=forecast_horizon)
         forecast_mean = forecast_result.predicted_mean
         forecast_ci = forecast_result.conf_int()
-        
+
         in_sample_pred = fitted_model.fittedvalues
         residuals = fitted_model.resid
-        
+
         model_info = {
             "aic": float(fitted_model.aic),
             "bic": float(fitted_model.bic),
@@ -211,11 +279,11 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
             "order": f"({p},{d},{q})",
             "seasonal_order": f"({P},{D},{Q},{m})" if seasonal else "None"
         }
-        
+
         last_date = series.index[-1]
         freq = pd.infer_freq(series.index) or 'D'
         forecast_index = pd.date_range(start=last_date, periods=forecast_horizon + 1, freq=freq)[1:]
-        
+
         return {
             "success": True,
             "forecast_values": forecast_mean.tolist(),
@@ -234,14 +302,15 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
             "error": str(e)
         }
 
-async def generate_ai_report(analysis_data: Dict[str, Any], report_mode: str = "court", 
+
+async def generate_ai_report(analysis_data: Dict[str, Any], report_mode: str = "court",
                             model_type: str = "gpt-4o-mini") -> str:
     """Generate AI report using OpenAI API"""
     try:
         api_key = os.environ.get('OPENAI_API_KEY')
         if not api_key:
             return "⚠️ Clé API OpenAI manquante. Veuillez configurer OPENAI_API_KEY dans le fichier .env"
-        
+
         if report_mode == "long":
             prompt = f"""Vous êtes un expert en analyse de séries temporelles. Analysez les données suivantes et fournissez un rapport détaillé et professionnel.
 
@@ -272,9 +341,9 @@ Rapport concis incluant:
 3. Qualité des prévisions et recommandations clés (5-6 phrases maximum)
 
 Soyez direct et actionnable."""
-        
+
         client = AsyncOpenAI(api_key=api_key)
-        
+
         response = await client.chat.completions.create(
             model=model_type,
             messages=[
@@ -284,14 +353,15 @@ Soyez direct et actionnable."""
             temperature=0.7,
             max_tokens=2000
         )
-        
+
         return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ Erreur lors de la génération du rapport IA: {str(e)}"
 
 
-# ============ API ROUTES ============
-
+# =====================================================
+# API ROUTES
+# =====================================================
 @api_router.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -322,16 +392,16 @@ async def upload_file(file: UploadFile = File(...)):
     try:
         if not file.filename.endswith(('.csv', '.xlsx', '.xls')):
             raise HTTPException(status_code=400, detail="Format non supporté. Utilisez CSV ou Excel (.xlsx, .xls)")
-        
+
         content = await file.read()
-        
+
         try:
             df = parse_dataframe(content, file.filename)
         except Exception as parse_error:
             raise HTTPException(status_code=400, detail=f"Erreur de parsing: {str(parse_error)}")
-        
+
         file_id = str(uuid.uuid4())
-        
+
         doc = {
             "file_id": file_id,
             "filename": file.filename,
@@ -340,9 +410,9 @@ async def upload_file(file: UploadFile = File(...)):
             "n_rows": len(df),
             "data": df.to_json(orient='split', date_format='iso')
         }
-        
+
         await db.timeseries_files.insert_one(doc)
-        
+
         return {
             "file_id": file_id,
             "filename": file.filename,
@@ -363,25 +433,25 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
         doc = await db.timeseries_files.find_one({"file_id": request.file_id}, {"_id": 0})
         if not doc:
             raise HTTPException(status_code=404, detail="Fichier non trouvé")
-        
+
         try:
             df = pd.read_json(io.StringIO(doc['data']), orient='split')
         except Exception as parse_error:
             raise HTTPException(status_code=400, detail=f"Erreur de parsing des données: {str(parse_error)}")
-        
+
         try:
             series = prepare_timeseries(df, request.date_column, request.value_column, request.duplicate_strategy)
         except Exception as prep_error:
             raise HTTPException(status_code=400, detail=f"Erreur de préparation: {str(prep_error)}")
-        
+
         original_data = {
             "dates": series.index.astype(str).tolist(),
             "values": series.tolist()
         }
-        
+
         stl_result = perform_stl_decomposition(series)
         adf_result = perform_adf_test(series)
-        
+
         summary = {
             "n_observations": len(series),
             "start_date": str(series.index[0]),
@@ -393,7 +463,7 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
             "missing_values": int(series.isna().sum()),
             "frequency": pd.infer_freq(series.index) or "Non détectée"
         }
-        
+
         return {
             "original": original_data,
             "stl": stl_result,
@@ -413,17 +483,17 @@ async def forecast_timeseries(request: ForecastRequest):
         doc = await db.timeseries_files.find_one({"file_id": request.file_id}, {"_id": 0})
         if not doc:
             raise HTTPException(status_code=404, detail="Fichier non trouvé")
-        
+
         df = pd.read_json(io.StringIO(doc['data']), orient='split')
         series = prepare_timeseries(df, request.date_column, request.value_column, request.duplicate_strategy)
-        
+
         result = train_forecast_model(
-            series, 
+            series,
             request.p, request.d, request.q,
             request.P, request.D, request.Q, request.m,
             request.forecast_horizon
         )
-        
+
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -460,5 +530,4 @@ app.add_middleware(
 # Root endpoint
 @app.get("/")
 async def main_root():
-
     return {"message": "TSA API - Time Series Analysis", "docs": "/docs"}
