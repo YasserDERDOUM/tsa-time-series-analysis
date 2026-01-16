@@ -18,19 +18,20 @@ from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 import warnings
 from openai import AsyncOpenAI
-from urllib.parse import urlsplit, urlunsplit, quote_plus  # ✅ added
+from urllib.parse import urlsplit, urlunsplit, quote_plus
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 
 # =====================================================
 # ENV / LOGS
 # =====================================================
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("tsa-api")
+
 
 def _get_env(name: str, required: bool = False, default: Optional[str] = None) -> str:
     val = os.getenv(name, default)
@@ -40,7 +41,7 @@ def _get_env(name: str, required: bool = False, default: Optional[str] = None) -
 
 
 # =====================================================
-# MONGODB (SAFE URI) ✅ FIX
+# MONGODB (SAFE URI)
 # =====================================================
 def sanitize_mongo_uri(uri: str) -> str:
     """
@@ -69,7 +70,6 @@ def sanitize_mongo_uri(uri: str) -> str:
     return urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
 
 
-# MongoDB connection ✅ FIX
 mongo_url_raw = _get_env("MONGO_URL", required=True)
 mongo_url = sanitize_mongo_uri(mongo_url_raw)
 
@@ -88,11 +88,7 @@ logger.info("Mongo configured (db=%s)", db_name)
 # =====================================================
 # FASTAPI
 # =====================================================
-
-# Create the main app without a prefix
 app = FastAPI()
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
 
@@ -111,7 +107,6 @@ class StatusCheckCreate(BaseModel):
     client_name: str
 
 
-# ============ TIME SERIES MODELS ============
 class ColumnSelectionRequest(BaseModel):
     file_id: str
     date_column: str
@@ -146,11 +141,10 @@ class AIReportRequest(BaseModel):
 # TIME SERIES HELPERS
 # =====================================================
 def parse_dataframe(file_content: bytes, filename: str) -> pd.DataFrame:
-    """Parse CSV or Excel file and return DataFrame"""
     try:
-        if filename.endswith('.csv'):
+        if filename.endswith(".csv"):
             df = pd.read_csv(io.BytesIO(file_content))
-        elif filename.endswith(('.xlsx', '.xls')):
+        elif filename.endswith((".xlsx", ".xls")):
             df = pd.read_excel(io.BytesIO(file_content))
         else:
             raise ValueError("Format de fichier non supporté. Utilisez CSV ou Excel.")
@@ -159,12 +153,16 @@ def parse_dataframe(file_content: bytes, filename: str) -> pd.DataFrame:
         raise HTTPException(status_code=400, detail=f"Erreur de parsing: {str(e)}")
 
 
-def prepare_timeseries(df: pd.DataFrame, date_col: str, value_col: str, duplicate_strategy: str = "mean") -> pd.Series:
-    """Prepare time series data: parse dates, handle duplicates, remove NaN"""
+def prepare_timeseries(
+    df: pd.DataFrame,
+    date_col: str,
+    value_col: str,
+    duplicate_strategy: str = "mean",
+) -> pd.Series:
     try:
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna(subset=[date_col, value_col])
-        df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+        df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
         df = df.dropna(subset=[value_col])
         df = df.sort_values(date_col)
 
@@ -180,13 +178,12 @@ def prepare_timeseries(df: pd.DataFrame, date_col: str, value_col: str, duplicat
 
 
 def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str, Any]:
-    """Perform STL decomposition"""
     try:
         if period is None:
             if len(series) > 2:
                 inferred_freq = pd.infer_freq(series.index)
                 if inferred_freq:
-                    period = {'D': 7, 'M': 12, 'Q': 4, 'Y': 1, 'W': 52}.get(inferred_freq[0], 12)
+                    period = {"D": 7, "M": 12, "Q": 4, "Y": 1, "W": 52}.get(inferred_freq[0], 12)
                 else:
                     period = 12
             else:
@@ -196,7 +193,7 @@ def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str
             return {
                 "success": False,
                 "error": f"Série trop courte pour décomposition STL (besoin d'au moins {2 * period} observations, seulement {len(series)} disponibles)",
-                "period": period
+                "period": period,
             }
 
         stl = STL(series, seasonal=period)
@@ -208,18 +205,13 @@ def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str
             "seasonal": result.seasonal.tolist(),
             "resid": result.resid.tolist(),
             "dates": series.index.astype(str).tolist(),
-            "period": period
+            "period": period,
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "period": period if period else 12
-        }
+        return {"success": False, "error": str(e), "period": period if period else 12}
 
 
 def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
-    """Perform Augmented Dickey-Fuller test for stationarity"""
     try:
         result = adfuller(series.dropna())
         adf_stat, p_value, usedlag, nobs, critical_values, icbest = result
@@ -238,26 +230,27 @@ def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
             "n_obs": int(nobs),
             "critical_values": {k: float(v) for k, v in critical_values.items()},
             "is_stationary": is_stationary,
-            "interpretation": interpretation
+            "interpretation": interpretation,
         }
     except Exception as e:
-        return {
-            "error": str(e),
-            "interpretation": "Impossible d'effectuer le test ADF"
-        }
+        return {"error": str(e), "interpretation": "Impossible d'effectuer le test ADF"}
 
 
-def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
-                         P: int = 0, D: int = 0, Q: int = 0, m: int = 12,
-                         forecast_horizon: int = 12) -> Dict[str, Any]:
-    """Train ARIMA/SARIMA model and generate forecasts"""
+def train_forecast_model(
+    series: pd.Series,
+    p: int,
+    d: int,
+    q: int,
+    P: int = 0,
+    D: int = 0,
+    Q: int = 0,
+    m: int = 12,
+    forecast_horizon: int = 12,
+) -> Dict[str, Any]:
     try:
         min_obs = max(p + d + P + D + m, 10)
         if len(series) < min_obs:
-            return {
-                "success": False,
-                "error": f"Série trop courte pour entraîner le modèle (besoin d'au moins {min_obs} observations)"
-            }
+            return {"success": False, "error": f"Série trop courte pour entraîner le modèle (besoin d'au moins {min_obs} observations)"}
 
         seasonal = P > 0 or D > 0 or Q > 0
         seasonal_order = (P, D, Q, m) if seasonal else (0, 0, 0, 0)
@@ -277,11 +270,11 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
             "bic": float(fitted_model.bic),
             "model_type": "SARIMA" if seasonal else "ARIMA",
             "order": f"({p},{d},{q})",
-            "seasonal_order": f"({P},{D},{Q},{m})" if seasonal else "None"
+            "seasonal_order": f"({P},{D},{Q},{m})" if seasonal else "None",
         }
 
         last_date = series.index[-1]
-        freq = pd.infer_freq(series.index) or 'D'
+        freq = pd.infer_freq(series.index) or "D"
         forecast_index = pd.date_range(start=last_date, periods=forecast_horizon + 1, freq=freq)[1:]
 
         return {
@@ -294,20 +287,19 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int,
             "in_sample_dates": series.index.astype(str).tolist(),
             "observed_values": series.tolist(),
             "residuals": residuals.tolist(),
-            "model_info": model_info
+            "model_info": model_info,
         }
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
 
-async def generate_ai_report(analysis_data: Dict[str, Any], report_mode: str = "court",
-                            model_type: str = "gpt-4o-mini") -> str:
-    """Generate AI report using OpenAI API"""
+async def generate_ai_report(
+    analysis_data: Dict[str, Any],
+    report_mode: str = "court",
+    model_type: str = "gpt-4o-mini",
+) -> str:
     try:
-        api_key = os.environ.get('OPENAI_API_KEY')
+        api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             return "⚠️ Clé API OpenAI manquante. Veuillez configurer OPENAI_API_KEY dans le fichier .env"
 
@@ -321,12 +313,7 @@ Votre rapport doit inclure:
 1. Description détaillée du dataset (colonnes, période, fréquence, qualité, valeurs manquantes)
 2. Interprétation approfondie de chaque graphique (série originale, tendance, saisonnalité, résidus)
 3. Analyse détaillée des prévisions (direction, saisonnalité, incertitude, intervalles de confiance)
-4. Recommandations techniques:
-   - Choix entre ARIMA et SARIMA
-   - Sélection des paramètres (p, d, q, P, D, Q, m)
-   - Suggestions de validation (backtesting, MAE, RMSE)
-   - Diagnostic des résidus
-   - Améliorations possibles du modèle
+4. Recommandations techniques (ARIMA vs SARIMA, paramètres, backtesting, diagnostics, améliorations)
 
 Fournissez un rapport structuré, professionnel et actionnable."""
         else:
@@ -338,22 +325,20 @@ DONNÉES:
 Rapport concis incluant:
 1. Résumé du dataset (3-4 phrases)
 2. Principaux insights (tendance, saisonnalité)
-3. Qualité des prévisions et recommandations clés (5-6 phrases maximum)
+3. Qualité des prévisions et recommandations clés (5-6 phrases max)
 
 Soyez direct et actionnable."""
 
         client = AsyncOpenAI(api_key=api_key)
-
         response = await client.chat.completions.create(
             model=model_type,
             messages=[
                 {"role": "system", "content": "Vous êtes un expert en analyse de séries temporelles et en modélisation statistique."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=2000
+            max_tokens=2000,
         )
-
         return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ Erreur lors de la génération du rapport IA: {str(e)}"
@@ -371,7 +356,7 @@ async def root():
 async def create_status_check(status_check: StatusCheckCreate):
     new_check = StatusCheck(client_name=status_check.client_name)
     check_dict = new_check.model_dump()
-    check_dict['timestamp'] = check_dict['timestamp'].isoformat()
+    check_dict["timestamp"] = check_dict["timestamp"].isoformat()
     await db.status_checks.insert_one(check_dict)
     return new_check
 
@@ -380,35 +365,28 @@ async def create_status_check(status_check: StatusCheckCreate):
 async def get_status_checks():
     status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
     for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
+        if isinstance(check["timestamp"], str):
+            check["timestamp"] = datetime.fromisoformat(check["timestamp"])
     return status_checks
 
 
-# ============ TIME SERIES ENDPOINTS ============
 @api_router.post("/timeseries/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload CSV or Excel file for time series analysis"""
     try:
-        if not file.filename.endswith(('.csv', '.xlsx', '.xls')):
+        if not file.filename.endswith((".csv", ".xlsx", ".xls")):
             raise HTTPException(status_code=400, detail="Format non supporté. Utilisez CSV ou Excel (.xlsx, .xls)")
 
         content = await file.read()
-
-        try:
-            df = parse_dataframe(content, file.filename)
-        except Exception as parse_error:
-            raise HTTPException(status_code=400, detail=f"Erreur de parsing: {str(parse_error)}")
+        df = parse_dataframe(content, file.filename)
 
         file_id = str(uuid.uuid4())
-
         doc = {
             "file_id": file_id,
             "filename": file.filename,
             "upload_date": datetime.now(timezone.utc).isoformat(),
             "columns": df.columns.tolist(),
             "n_rows": len(df),
-            "data": df.to_json(orient='split', date_format='iso')
+            "data": df.to_json(orient="split", date_format="iso"),
         }
 
         await db.timeseries_files.insert_one(doc)
@@ -418,7 +396,7 @@ async def upload_file(file: UploadFile = File(...)):
             "filename": file.filename,
             "columns": df.columns.tolist(),
             "n_rows": len(df),
-            "preview": df.head(5).to_dict(orient='records')
+            "preview": df.head(5).to_dict(orient="records"),
         }
     except HTTPException:
         raise
@@ -428,27 +406,15 @@ async def upload_file(file: UploadFile = File(...)):
 
 @api_router.post("/timeseries/analyze")
 async def analyze_timeseries(request: ColumnSelectionRequest):
-    """Analyze time series: original plot, STL decomposition, ADF test"""
     try:
         doc = await db.timeseries_files.find_one({"file_id": request.file_id}, {"_id": 0})
         if not doc:
             raise HTTPException(status_code=404, detail="Fichier non trouvé")
 
-        try:
-            df = pd.read_json(io.StringIO(doc['data']), orient='split')
-        except Exception as parse_error:
-            raise HTTPException(status_code=400, detail=f"Erreur de parsing des données: {str(parse_error)}")
+        df = pd.read_json(io.StringIO(doc["data"]), orient="split")
+        series = prepare_timeseries(df, request.date_column, request.value_column, request.duplicate_strategy)
 
-        try:
-            series = prepare_timeseries(df, request.date_column, request.value_column, request.duplicate_strategy)
-        except Exception as prep_error:
-            raise HTTPException(status_code=400, detail=f"Erreur de préparation: {str(prep_error)}")
-
-        original_data = {
-            "dates": series.index.astype(str).tolist(),
-            "values": series.tolist()
-        }
-
+        original_data = {"dates": series.index.astype(str).tolist(), "values": series.tolist()}
         stl_result = perform_stl_decomposition(series)
         adf_result = perform_adf_test(series)
 
@@ -461,15 +427,10 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
             "min": float(series.min()),
             "max": float(series.max()),
             "missing_values": int(series.isna().sum()),
-            "frequency": pd.infer_freq(series.index) or "Non détectée"
+            "frequency": pd.infer_freq(series.index) or "Non détectée",
         }
 
-        return {
-            "original": original_data,
-            "stl": stl_result,
-            "adf": adf_result,
-            "summary": summary
-        }
+        return {"original": original_data, "stl": stl_result, "adf": adf_result, "summary": summary}
     except HTTPException:
         raise
     except Exception as e:
@@ -478,30 +439,31 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
 
 @api_router.post("/timeseries/forecast")
 async def forecast_timeseries(request: ForecastRequest):
-    """Train ARIMA/SARIMA model and generate forecasts"""
     try:
         doc = await db.timeseries_files.find_one({"file_id": request.file_id}, {"_id": 0})
         if not doc:
             raise HTTPException(status_code=404, detail="Fichier non trouvé")
 
-        df = pd.read_json(io.StringIO(doc['data']), orient='split')
+        df = pd.read_json(io.StringIO(doc["data"]), orient="split")
         series = prepare_timeseries(df, request.date_column, request.value_column, request.duplicate_strategy)
 
-        result = train_forecast_model(
+        return train_forecast_model(
             series,
-            request.p, request.d, request.q,
-            request.P, request.D, request.Q, request.m,
-            request.forecast_horizon
+            request.p,
+            request.d,
+            request.q,
+            request.P,
+            request.D,
+            request.Q,
+            request.m,
+            request.forecast_horizon,
         )
-
-        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @api_router.post("/timeseries/ai-report")
 async def generate_report(request: AIReportRequest):
-    """Generate AI-powered analysis report"""
     try:
         report = await generate_ai_report(request.analysis_data, request.report_mode, request.model_type)
         return {"report": report}
@@ -509,23 +471,36 @@ async def generate_report(request: AIReportRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Include the router in the app
+# Mount router
 app.include_router(api_router)
 
-# CORS Configuration
-cors_origins = os.environ.get("CORS_ORIGINS", "*")
-if cors_origins == "*":
-    origins = ["*"]
+
+# =====================================================
+# ✅ CORS (FIXED)
+# =====================================================
+cors_origins_raw = os.environ.get("CORS_ORIGINS", "").strip()
+
+# Si vide -> on autorise localhost (dev)
+if not cors_origins_raw:
+    origins = ["http://localhost:3000"]
 else:
-    origins = [origin.strip() for origin in cors_origins.split(",")]
+    origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+
+# Si l’utilisateur met "*" -> on doit désactiver credentials
+allow_credentials = True
+if len(origins) == 1 and origins[0] == "*":
+    allow_credentials = False
+
+logger.info("CORS origins=%s | allow_credentials=%s", origins, allow_credentials)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=origins,         # jamais ["*"] avec credentials=True
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Root endpoint
 @app.get("/")
