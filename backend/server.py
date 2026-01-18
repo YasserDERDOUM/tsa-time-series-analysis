@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -20,6 +20,9 @@ import warnings
 from openai import AsyncOpenAI
 from urllib.parse import urlsplit, urlunsplit, quote_plus
 
+# numpy is used indirectly, but we need it for type checks
+import numpy as np
+
 warnings.filterwarnings("ignore")
 
 
@@ -38,6 +41,55 @@ def _get_env(name: str, required: bool = False, default: Optional[str] = None) -
     if required and (val is None or str(val).strip() == ""):
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
+
+
+# =====================================================
+# JSON SAFE (IMPORTANT FIX FOR numpy types)
+# =====================================================
+def to_jsonable(obj: Any) -> Any:
+    """
+    Recursively convert numpy / pandas types into JSON-serializable Python types.
+    Fixes: numpy.bool_, numpy.int64, numpy.float64, numpy arrays, pandas timestamps.
+    """
+    # primitives
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # numpy scalar types
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+
+    # numpy arrays
+    if isinstance(obj, np.ndarray):
+        return [to_jsonable(x) for x in obj.tolist()]
+
+    # pandas types
+    if isinstance(obj, (pd.Timestamp,)):
+        return obj.isoformat()
+    if isinstance(obj, (pd.Timedelta,)):
+        return str(obj)
+
+    # dict
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+
+    # list/tuple/set
+    if isinstance(obj, (list, tuple, set)):
+        return [to_jsonable(x) for x in obj]
+
+    # fallback: try to coerce
+    try:
+        if hasattr(obj, "item"):
+            return to_jsonable(obj.item())
+    except Exception:
+        pass
+
+    # last resort: string
+    return str(obj)
 
 
 # =====================================================
@@ -79,6 +131,31 @@ logger.info("Mongo configured (db=%s)", db_name)
 # =====================================================
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+
+
+# =====================================================
+# CORS (IMPORTANT)
+# =====================================================
+# Render env example:
+# CORS_ORIGINS=https://tsafr0.netlify.app,http://localhost:3000
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+origins = [o.strip().rstrip("/") for o in cors_origins.split(",") if o.strip()]
+
+logger.info("CORS origins=%s | allow_credentials=False | regex=netlify", origins)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_origin_regex=r"^https://.*\.netlify\.app$",  # allow all netlify deploys
+    allow_credentials=False,  # ✅ MUST be False here
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# preflight safety
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return JSONResponse(content={"ok": True})
 
 
 # =====================================================
@@ -164,33 +241,39 @@ def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str
             period = {"D": 7, "M": 12, "Q": 4, "Y": 1, "W": 52}.get(inferred[0], 12) if inferred else 12
 
         if len(series) < 2 * period:
-            return {"success": False, "error": f"Série trop courte pour STL (>= {2*period} obs, obtenu {len(series)})", "period": period}
+            return {
+                "success": False,
+                "error": f"Série trop courte pour STL (>= {2*period} obs, obtenu {len(series)})",
+                "period": int(period),
+            }
 
         stl = STL(series, seasonal=period)
         result = stl.fit()
+
         return {
             "success": True,
             "trend": result.trend.tolist(),
             "seasonal": result.seasonal.tolist(),
             "resid": result.resid.tolist(),
             "dates": series.index.astype(str).tolist(),
-            "period": period,
+            "period": int(period),
         }
     except Exception as e:
-        return {"success": False, "error": str(e), "period": period or 12}
+        return {"success": False, "error": str(e), "period": int(period or 12)}
 
 
 def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
     try:
         adf_stat, p_value, usedlag, nobs, critical_values, _ = adfuller(series.dropna())
-        is_stationary = p_value < 0.05
+        is_stationary = p_value < 0.05  # can be numpy.bool_ depending on types
+
         return {
             "adf_statistic": float(adf_stat),
             "p_value": float(p_value),
             "used_lag": int(usedlag),
             "n_obs": int(nobs),
             "critical_values": {k: float(v) for k, v in critical_values.items()},
-            "is_stationary": is_stationary,
+            "is_stationary": bool(is_stationary),  # ✅ ensure python bool
             "interpretation": (
                 f"La série est {'stationnaire' if is_stationary else 'non-stationnaire'} "
                 f"(p-value = {p_value:.4f}). "
@@ -270,31 +353,6 @@ Mode: {report_mode}. Donnez un rapport {'détaillé' if report_mode=='long' else
 
 
 # =====================================================
-# CORS (IMPORTANT: DO BEFORE TESTING)
-# =====================================================
-# Exemple Render env:
-# CORS_ORIGINS=https://tsafr.netlify.app,http://localhost:3000
-cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
-origins = [o.strip().rstrip("/") for o in cors_origins.split(",") if o.strip()]
-
-logger.info("CORS origins=%s | allow_credentials=False | regex=netlify", origins)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,  # tes origines "fixes"
-    allow_origin_regex=r"^https://.*\.netlify\.app$",  # toutes les previews netlify
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# OPTIONs catch-all (utile si preflight capricieux)
-@app.options("/{path:path}")
-async def options_handler(path: str):
-    return JSONResponse(content={"ok": True})
-
-
-# =====================================================
 # ROUTES
 # =====================================================
 @api_router.get("/")
@@ -321,13 +379,13 @@ async def upload_file(file: UploadFile = File(...)):
             "data": df.to_json(orient="split", date_format="iso"),
         })
 
-        return {
+        return to_jsonable({
             "file_id": file_id,
             "filename": file.filename,
             "columns": df.columns.tolist(),
             "n_rows": len(df),
             "preview": df.head(5).to_dict(orient="records"),
-        }
+        })
     except HTTPException:
         raise
     except Exception as e:
@@ -349,7 +407,7 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
         adf_result = perform_adf_test(series)
 
         summary = {
-            "n_observations": len(series),
+            "n_observations": int(len(series)),
             "start_date": str(series.index[0]),
             "end_date": str(series.index[-1]),
             "mean": float(series.mean()),
@@ -357,15 +415,19 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
             "min": float(series.min()),
             "max": float(series.max()),
             "missing_values": int(series.isna().sum()),
-            "frequency": pd.infer_freq(series.index) or "Non détectée",
+            "frequency": str(pd.infer_freq(series.index) or "Non détectée"),
         }
 
-        return {
+        payload = {
             "original": {"dates": series.index.astype(str).tolist(), "values": series.tolist()},
             "stl": stl_result,
             "adf": adf_result,
             "summary": summary,
         }
+
+        # ✅ critical: convert everything to JSON-safe
+        return to_jsonable(payload)
+
     except HTTPException:
         raise
     except Exception as e:
@@ -389,7 +451,7 @@ async def forecast_timeseries(request: ForecastRequest):
             request.P, request.D, request.Q, request.m,
             request.forecast_horizon,
         )
-        return result
+        return to_jsonable(result)
     except Exception as e:
         logger.exception("forecast_timeseries error")
         raise HTTPException(status_code=500, detail=str(e))
