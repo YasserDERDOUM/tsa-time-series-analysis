@@ -20,7 +20,6 @@ import warnings
 from openai import AsyncOpenAI
 from urllib.parse import urlsplit, urlunsplit, quote_plus
 
-# numpy is used indirectly, but we need it for type checks
 import numpy as np
 
 warnings.filterwarnings("ignore")
@@ -51,11 +50,9 @@ def to_jsonable(obj: Any) -> Any:
     Recursively convert numpy / pandas types into JSON-serializable Python types.
     Fixes: numpy.bool_, numpy.int64, numpy.float64, numpy arrays, pandas timestamps.
     """
-    # primitives
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
 
-    # numpy scalar types
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -63,32 +60,26 @@ def to_jsonable(obj: Any) -> Any:
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
 
-    # numpy arrays
     if isinstance(obj, np.ndarray):
         return [to_jsonable(x) for x in obj.tolist()]
 
-    # pandas types
     if isinstance(obj, (pd.Timestamp,)):
         return obj.isoformat()
     if isinstance(obj, (pd.Timedelta,)):
         return str(obj)
 
-    # dict
     if isinstance(obj, dict):
         return {str(k): to_jsonable(v) for k, v in obj.items()}
 
-    # list/tuple/set
     if isinstance(obj, (list, tuple, set)):
         return [to_jsonable(x) for x in obj]
 
-    # fallback: try to coerce
     try:
         if hasattr(obj, "item"):
             return to_jsonable(obj.item())
     except Exception:
         pass
 
-    # last resort: string
     return str(obj)
 
 
@@ -141,18 +132,18 @@ api_router = APIRouter(prefix="/api")
 cors_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
 origins = [o.strip().rstrip("/") for o in cors_origins.split(",") if o.strip()]
 
-logger.info("CORS origins=%s | allow_credentials=False | regex=netlify", origins)
+logger.info("CORS origins=%s | allow_credentials=False | allow_origin_regex=netlify", origins)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_origin_regex=r"^https://.*\.netlify\.app$",  # allow all netlify deploys
-    allow_credentials=False,  # ✅ MUST be False here
+    allow_credentials=False,  # ✅ must stay False when using wildcard/regex
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# preflight safety
+# preflight safety (optional but helps some clients)
 @app.options("/{path:path}")
 async def options_handler(path: str):
     return JSONResponse(content={"ok": True})
@@ -198,7 +189,8 @@ class ForecastRequest(BaseModel):
 class AIReportRequest(BaseModel):
     file_id: str
     analysis_data: Dict[str, Any]
-    model_type: str = "gpt-5-mini"
+    # ⚠️ ton front envoie peut-être "gpt-5-mini" -> on gère côté backend (fallback)
+    model_type: str = "gpt-4o-mini"
     report_mode: str = "court"
 
 
@@ -265,7 +257,7 @@ def perform_stl_decomposition(series: pd.Series, period: int = None) -> Dict[str
 def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
     try:
         adf_stat, p_value, usedlag, nobs, critical_values, _ = adfuller(series.dropna())
-        is_stationary = p_value < 0.05  # can be numpy.bool_ depending on types
+        is_stationary = p_value < 0.05
 
         return {
             "adf_statistic": float(adf_stat),
@@ -273,7 +265,7 @@ def perform_adf_test(series: pd.Series) -> Dict[str, Any]:
             "used_lag": int(usedlag),
             "n_obs": int(nobs),
             "critical_values": {k: float(v) for k, v in critical_values.items()},
-            "is_stationary": bool(is_stationary),  # ✅ ensure python bool
+            "is_stationary": bool(is_stationary),
             "interpretation": (
                 f"La série est {'stationnaire' if is_stationary else 'non-stationnaire'} "
                 f"(p-value = {p_value:.4f}). "
@@ -325,30 +317,53 @@ def train_forecast_model(series: pd.Series, p: int, d: int, q: int, P: int = 0, 
         return {"success": False, "error": str(e)}
 
 
-async def generate_ai_report(analysis_data: Dict[str, Any], report_mode: str = "court", model_type: str = "gpt-4o-mini") -> str:
+async def generate_ai_report(
+    analysis_data: Dict[str, Any],
+    report_mode: str = "court",
+    model_type: str = "gpt-4o-mini",
+) -> str:
+    """
+    ✅ Fix OpenAI param:
+      - replace max_tokens -> max_completion_tokens
+    ✅ Safe model fallback:
+      - if front sends unsupported name, fallback to env OPENAI_MODEL or gpt-4o-mini
+    """
     try:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             return "⚠️ OPENAI_API_KEY manquante sur le backend (Render)."
 
+        # model selection (env overrides)
+        env_model = os.getenv("OPENAI_MODEL")
+        chosen_model = (env_model or model_type or "gpt-4o-mini").strip()
+
+        # (optionnel) petit fallback si le front envoie "gpt-5-mini"
+        if chosen_model.lower() in {"gpt-5-mini", "gpt5-mini"}:
+            chosen_model = "gpt-4o-mini"
+
         prompt = f"""Vous êtes un expert en analyse de séries temporelles.
 DONNÉES:
 {json.dumps(analysis_data, indent=2, ensure_ascii=False)}
 
-Mode: {report_mode}. Donnez un rapport {'détaillé' if report_mode=='long' else 'concis'} et actionnable."""
+Mode: {report_mode}. Donnez un rapport {"détaillé" if report_mode=="long" else "concis"} et actionnable.
+"""
 
         client = AsyncOpenAI(api_key=api_key)
+
         resp = await client.chat.completions.create(
-            model=model_type,
+            model=chosen_model,
             messages=[
                 {"role": "system", "content": "Expert séries temporelles."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=2000,
+            # ✅ IMPORTANT: new param name for these models
+            max_completion_tokens=2000,
         )
         return resp.choices[0].message.content
+
     except Exception as e:
+        logger.exception("generate_ai_report error")
         return f"⚠️ Erreur IA: {str(e)}"
 
 
@@ -386,6 +401,7 @@ async def upload_file(file: UploadFile = File(...)):
             "n_rows": len(df),
             "preview": df.head(5).to_dict(orient="records"),
         })
+
     except HTTPException:
         raise
     except Exception as e:
@@ -425,7 +441,6 @@ async def analyze_timeseries(request: ColumnSelectionRequest):
             "summary": summary,
         }
 
-        # ✅ critical: convert everything to JSON-safe
         return to_jsonable(payload)
 
     except HTTPException:
@@ -452,6 +467,7 @@ async def forecast_timeseries(request: ForecastRequest):
             request.forecast_horizon,
         )
         return to_jsonable(result)
+
     except Exception as e:
         logger.exception("forecast_timeseries error")
         raise HTTPException(status_code=500, detail=str(e))
